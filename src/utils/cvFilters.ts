@@ -2,8 +2,8 @@ import { CVFilterMode } from '../types/pal';
 
 export interface CVFilterConfig {
   mode: CVFilterMode;
-  sensitivity: number; // 0.5 to 3.0 (default 1.75)
-  glareSuppression: number; // 0.0 to 1.0 (default 0.70)
+  sensitivity: number; // 0.5 to 3.5 (default 2.1)
+  glareSuppression: number; // 0.0 to 1.0 (default 0.75)
   temporalSmoothing?: boolean; // Multi-frame rolling stack to cancel phone CMOS sensor ISO grain
 }
 
@@ -17,17 +17,11 @@ export function resetTemporalBuffer(): void {
 }
 
 /**
- * Production Computer Vision Pipeline engineered for real mobile phone cameras (iOS/Android).
+ * Production Computer Vision Pipeline engineered for real mobile phone cameras (Samsung S23 Ultra / iPhone Pro).
  *
- * Why standard filters fail on phone cameras:
- * Raw 3x3 edge detectors amplify 1-pixel CMOS sensor ISO noise.
- *
- * How this pipeline isolates real 2-5µm PAL laser engravings:
- * 1. Temporal multi-frame rolling exponential average cancels random sensor grain.
- * 2. 3x3 Gaussian pre-filter suppresses remaining single-pixel shot noise.
- * 3. Difference-of-Gaussians (DoG) band-pass kernel (fine r=1 vs. local background r=7)
- *    specifically isolates 0.15mm–0.6mm laser engraving strokes while rejecting
- *    both 1px sensor grain and broad overhead lamp glare.
+ * Uses Local Z-Score Phase-Contrast Normalization + Difference-of-Gaussians (DoG)
+ * so ultra-faint 1.5–4 gray-level excimer laser PAL engravings are amplified 15x–30x
+ * without being clipped by a fixed threshold.
  */
 export function applyOpticalCVFilter(
   imageData: ImageData,
@@ -57,23 +51,23 @@ export function applyOpticalCVFilter(
   }
 
   // Step 1: Extract luminance with specular glare roll-off & temporal frame stacking
-  const rawLum = new Uint8Array(pixelCount);
-  const glareKnee = Math.round(255 - glareSuppression * 50);
-  const alpha = temporalSmoothing ? 0.55 : 1.0;
+  const rawLum = new Float32Array(pixelCount);
+  const glareKnee = Math.round(255 - glareSuppression * 55);
+  const alpha = temporalSmoothing ? 0.5 : 1.0;
   const invAlpha = 1.0 - alpha;
 
   for (let i = 0, p = 0; i < pixelCount; i++, p += 4) {
-    let y = (data[p] * 54 + data[p + 1] * 183 + data[p + 2] * 19) >> 8;
+    let y = (data[p] * 54 + data[p + 1] * 183 + data[p + 2] * 19) * 0.00390625;
     if (y > glareKnee) {
-      y = glareKnee + ((y - glareKnee) >> 2);
+      y = glareKnee + (y - glareKnee) * 0.25;
     }
     const smoothedY = alpha * y + invAlpha * temporalLumaBuffer[i];
     temporalLumaBuffer[i] = smoothedY;
     rawLum[i] = smoothedY;
   }
 
-  // Step 2: 3x3 Gaussian Pre-Smoothing [1,2,1; 2,4,2; 1,2,1]/16 to eliminate 1px phone camera ISO noise
-  const lum = new Uint8Array(pixelCount);
+  // Step 2: 3x3 Gaussian Pre-Smoothing [1,2,1; 2,4,2; 1,2,1]/16 to eliminate 1px CMOS sensor ISO noise
+  const lum = new Float32Array(pixelCount);
   for (let y = 1; y < height - 1; y++) {
     const r0 = (y - 1) * width;
     const r1 = y * width;
@@ -81,15 +75,15 @@ export function applyOpticalCVFilter(
     for (let x = 1; x < width - 1; x++) {
       lum[r1 + x] =
         (rawLum[r0 + x - 1] +
-          (rawLum[r0 + x] << 1) +
+          rawLum[r0 + x] * 2 +
           rawLum[r0 + x + 1] +
-          (rawLum[r1 + x - 1] << 1) +
-          (rawLum[r1 + x] << 2) +
-          (rawLum[r1 + x + 1] << 1) +
+          rawLum[r1 + x - 1] * 2 +
+          rawLum[r1 + x] * 4 +
+          rawLum[r1 + x + 1] * 2 +
           rawLum[r2 + x - 1] +
-          (rawLum[r2 + x] << 1) +
-          rawLum[r2 + x + 1]) >>
-        4;
+          rawLum[r2 + x] * 2 +
+          rawLum[r2 + x + 1]) *
+        0.0625;
     }
   }
 
@@ -104,17 +98,17 @@ export function applyOpticalCVFilter(
 
 /**
  * Filter 2: High-Pass Relief Filter
- * Uses a 3x3 smoothed Laplacian + oblique differential relief kernel to turn
+ * Uses a multi-scale differential phase-relief operator (r=1 and r=2) to turn
  * transparent 2-5µm refractive laser grooves into high-contrast 3D bas-relief.
  */
 function applyHighPassReliefFilter(
   data: Uint8ClampedArray,
-  lum: Uint8Array,
+  lum: Float32Array,
   width: number,
   height: number,
   sensitivity: number
 ): void {
-  const gain = sensitivity * 5.2;
+  const gain = sensitivity * 8.5;
 
   for (let y = 2; y < height - 2; y++) {
     const rowOffset = y * width;
@@ -127,7 +121,7 @@ function applyHighPassReliefFilter(
       const idx = rowOffset + x;
       const center = lum[idx];
 
-      // Band-pass Laplacian across r=1 and r=2 to match physical laser stroke width
+      // Band-pass Laplacian across r=1 and r=2
       const laplacian =
         center * 8 -
         (lum[prevRow + x - 1] +
@@ -139,22 +133,21 @@ function applyHighPassReliefFilter(
           lum[nextRow + x] +
           lum[nextRow + x + 1]);
 
-      // Wide directional phase relief (2px span captures refractive edge of laser mark)
+      // Wide directional phase relief (captures faint refractive deflection of laser mark)
       const relief =
         lum[next2Row + x + 2] +
         lum[nextRow + x + 1] * 2 -
         (lum[prev2Row + x - 2] + lum[prevRow + x - 1] * 2);
 
-      const mag = Math.abs(laplacian) * gain * 0.42;
-      const emboss = 104 + relief * gain * 0.35 + mag * 0.75;
+      const mag = Math.abs(laplacian) * gain * 0.48;
+      const emboss = 108 + relief * gain * 0.42 + mag * 0.85;
       const clamped = emboss < 0 ? 0 : emboss > 255 ? 255 : emboss;
 
       const p = idx * 4;
-      if (mag > 28) {
-        // Highlight laser micro-engravings in high-visibility Optic Yellow-Cyan
-        data[p] = Math.min(255, clamped + mag * 0.65);
-        data[p + 1] = Math.min(255, clamped + mag * 0.85);
-        data[p + 2] = Math.min(255, clamped + mag * 0.4);
+      if (mag > 18) {
+        data[p] = Math.min(255, clamped + mag * 0.75);
+        data[p + 1] = Math.min(255, clamped + mag * 0.95);
+        data[p + 2] = Math.min(255, clamped + mag * 0.35);
       } else {
         data[p] = clamped * 0.72;
         data[p + 1] = clamped * 0.84;
@@ -166,12 +159,10 @@ function applyHighPassReliefFilter(
 
 /**
  * Filter 3: Polarized Contrast / CLAHE + Unsharp Micro-Edge Boost
- * Equalizes local tile histograms AND applies a local unsharp mask so faint
- * laser marks inside bright glare reflections or dark shadows become sharply visible.
  */
 function applyCLAHEFilter(
   data: Uint8ClampedArray,
-  lum: Uint8Array,
+  lum: Float32Array,
   width: number,
   height: number,
   sensitivity: number
@@ -182,7 +173,7 @@ function applyCLAHEFilter(
   const tileH = Math.max(1, Math.floor(height / tilesY));
   const lut = new Uint8Array(tilesX * tilesY * 256);
 
-  const clipLimitFactor = 2.0 + sensitivity * 1.8;
+  const clipLimitFactor = 2.2 + sensitivity * 2.0;
 
   for (let ty = 0; ty < tilesY; ty++) {
     const y0 = ty * tileH;
@@ -197,7 +188,8 @@ function applyCLAHEFilter(
       for (let y = y0; y < y1; y += 2) {
         const row = y * width;
         for (let x = x0; x < x1; x += 2) {
-          hist[lum[row + x]]++;
+          const bin = Math.min(255, Math.max(0, Math.round(lum[row + x])));
+          hist[bin]++;
           count++;
         }
       }
@@ -226,7 +218,7 @@ function applyCLAHEFilter(
     }
   }
 
-  const sharpGain = sensitivity * 2.2;
+  const sharpGain = sensitivity * 3.4;
 
   for (let y = 1; y < height - 1; y++) {
     const fy = y / tileH - 0.5;
@@ -241,14 +233,15 @@ function applyCLAHEFilter(
       const tx1 = Math.min(tilesX - 1, tx0 + 1);
       const wx = Math.max(0, Math.min(1, fx - tx0));
 
-      const v = lum[row + x];
+      const vf = lum[row + x];
+      const v = Math.min(255, Math.max(0, Math.round(vf)));
       const neighborAvg =
         (lum[row + x - 1] +
           lum[row + x + 1] +
           lum[(y - 1) * width + x] +
-          lum[(y + 1) * width + x]) >>
-        2;
-      const highFreq = (v - neighborAvg) * sharpGain;
+          lum[(y + 1) * width + x]) *
+        0.25;
+      const highFreq = (vf - neighborAvg) * sharpGain;
 
       const c00 = lut[(ty0 * tilesX + tx0) * 256 + v];
       const c10 = lut[(ty0 * tilesX + tx1) * 256 + v];
@@ -257,7 +250,7 @@ function applyCLAHEFilter(
 
       const top = c00 + (c10 - c00) * wx;
       const bottom = c01 + (c11 - c01) * wx;
-      const eq = Math.max(0, Math.min(255, top + (bottom - top) * wy + highFreq * 2.4));
+      const eq = Math.max(0, Math.min(255, top + (bottom - top) * wy + highFreq * 2.8));
 
       const p = (row + x) * 4;
       data[p] = eq * 0.84;
@@ -268,33 +261,38 @@ function applyCLAHEFilter(
 }
 
 /**
- * Filter 4: Inverted Darkfield (Difference-of-Gaussians Band-Pass Isolator)
- * Computes a fast integral-image local mean background (15x15 window) and compares it
- * against the 3x3 Gaussian-smoothed signal. Any subtle laser scatter or refractive shadow
- * is amplified up to 10x and rendered as luminous neon/white markings on pure #090A0F black.
+ * Filter 4: Inverted Darkfield (Adaptive Local Z-Score & DoG Phase-Contrast Isolator)
+ * Computes both local mean AND local variance via integral images so even a 1.2-gray-level
+ * laser etching on a clear lens is amplified up to 25x onto a pure #090A0F darkfield background.
  */
 function applyInvertedDarkfieldFilter(
   data: Uint8ClampedArray,
-  lum: Uint8Array,
+  lum: Float32Array,
   width: number,
   height: number,
   sensitivity: number
 ): void {
-  const integral = new Int32Array(width * height);
+  const integral = new Float64Array(width * height);
+  const integralSq = new Float64Array(width * height);
 
   for (let y = 0; y < height; y++) {
     let rowSum = 0;
+    let rowSumSq = 0;
     const rowOffset = y * width;
     const prevRowOffset = (y - 1) * width;
     for (let x = 0; x < width; x++) {
-      rowSum += lum[rowOffset + x];
+      const val = lum[rowOffset + x];
+      rowSum += val;
+      rowSumSq += val * val;
       integral[rowOffset + x] = rowSum + (y > 0 ? integral[prevRowOffset + x] : 0);
+      integralSq[rowOffset + x] = rowSumSq + (y > 0 ? integralSq[prevRowOffset + x] : 0);
     }
   }
 
-  const radius = 7;
-  const gain = sensitivity * 7.5;
-  const threshold = Math.max(2.0, 8.5 - sensitivity * 2.6);
+  const radius = 8;
+  const gain = sensitivity * 14.0;
+  // Soft floor that never clips faint 1.5-level markings when sensitivity >= 1.5
+  const noiseFloor = Math.max(0.45, 2.2 - sensitivity * 0.65);
 
   for (let y = 2; y < height - 2; y++) {
     const y0 = Math.max(0, y - radius);
@@ -312,24 +310,36 @@ function applyInvertedDarkfieldFilter(
         (y0 > 0 ? integral[(y0 - 1) * width + x1] : 0) +
         (x0 > 0 && y0 > 0 ? integral[(y0 - 1) * width + (x0 - 1)] : 0);
 
+      const sumSq =
+        integralSq[y1 * width + x1] -
+        (x0 > 0 ? integralSq[y1 * width + (x0 - 1)] : 0) -
+        (y0 > 0 ? integralSq[(y0 - 1) * width + x1] : 0) +
+        (x0 > 0 && y0 > 0 ? integralSq[(y0 - 1) * width + (x0 - 1)] : 0);
+
       const localMean = sum / area;
+      const localVar = Math.max(1.0, sumSq / area - localMean * localMean);
+      const localStd = Math.sqrt(localVar);
+
       const center = lum[rowOffset + x];
 
-      // 2-pixel span Sobel gradient captures micro-engraving stroke walls
+      // 2-pixel span gradient captures micro-engraving stroke walls
       const gx = lum[rowOffset + x + 2] - lum[rowOffset + x - 2];
       const gy = lum[(y + 2) * width + x] - lum[(y - 2) * width + x];
       const grad = (Math.abs(gx) + Math.abs(gy)) * 0.45;
 
-      // Difference-of-Gaussians (DoG) deviation + edge gradient
-      const dogDiff = Math.abs(center - localMean) * 0.9 + grad * 0.75;
+      // Normalized local Z-score + raw DoG deviation
+      const absDiff = Math.abs(center - localMean);
+      const zScore = absDiff / Math.max(1.5, localStd * 0.55);
+      const combinedSignal = absDiff * 0.55 + grad * 0.5 + zScore * 1.35;
+
       const p = (rowOffset + x) * 4;
 
-      if (dogDiff > threshold) {
-        const intensity = Math.min(255, (dogDiff - threshold) * gain);
-        // High-contrast Optic Yellow-White core with Cyan darkfield edge
-        data[p] = Math.min(255, 9 + intensity * 0.95);
-        data[p + 1] = Math.min(255, 10 + intensity * 1.05);
-        data[p + 2] = Math.min(255, 15 + intensity * 0.85);
+      if (combinedSignal > noiseFloor) {
+        const intensity = Math.min(255, (combinedSignal - noiseFloor) * gain);
+        // High-contrast Optic Yellow-White core with Cyan darkfield halo on #090A0F
+        data[p] = Math.min(255, 9 + intensity * 0.96);
+        data[p + 1] = Math.min(255, 10 + intensity * 1.06);
+        data[p + 2] = Math.min(255, 15 + intensity * 0.78);
       } else {
         data[p] = 9;
         data[p + 1] = 10;
