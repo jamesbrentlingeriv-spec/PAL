@@ -1,0 +1,36 @@
+{
+  "name": "pal-scope",
+  "private": true,
+  "version": "1.0.0",
+  "description": "PAL-Scope — Bench-Side Progressive Addition Lens Identifier & Vision Enhancement PWA",
+  "type": "module",
+  "scripts": {
+    "dev": "node --require ./scripts/crypto-polyfill.cjs ./node_modules/vite/bin/vite.js",
+    "build": "tsc -b && node --require ./scripts/crypto-polyfill.cjs ./node_modules/vite/bin/vite.js build",
+    "preview": "node --require ./scripts/crypto-polyfill.cjs ./node_modules/vite/bin/vite.js preview"
+  },
+  "dependencies": {
+    "dexie": "^4.0.10",
+    "lucide-react": "^0.468.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0",
+    "tesseract.js": "^5.1.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "@vitejs/plugin-react": "^4.3.4",
+    "autoprefixer": "^10.4.20",
+    "esbuild": "npm:esbuild-wasm@^0.24.2",
+    "postcss": "^8.4.49",
+    "rollup": "npm:@rollup/wasm-node@^4.30.0",
+    "tailwindcss": "^3.4.17",
+    "typescript": "~5.6.2",
+    "vite": "^6.0.3",
+    "vite-plugin-pwa": "^0.21.1"
+  },
+  "overrides": {
+    "esbuild": "npm:esbuild-wasm@^0.24.2",
+    "rollup": "npm:@rollup/wasm-node@^4.30.0"
+  }
+}

@@ -1,0 +1,67 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  html, body, #root {
+    height: 100%;
+    width: 100%;
+    background-color: #090A0F;
+    color: #F8FAFC;
+    overscroll-behavior: none;
+    touch-action: manipulation;
+    user-select: none;
+    -webkit-user-select: none;
+  }
+}
+
+/* Custom Tactical Scrollbar for Bench UI */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: #090A0F;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #252B3D;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #00F0FF;
+}
+
+/* Range Input Styling for Bench Precision Sliders */
+input[type="range"].bench-slider {
+  -webkit-appearance: none;
+  appearance: none;
+  background: #161A26;
+  height: 8px;
+  border-radius: 999px;
+  border: 1px solid #252B3D;
+}
+
+input[type="range"].bench-slider::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  appearance: none;
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #E2F804;
+  border: 2px solid #090A0F;
+  box-shadow: 0 0 10px rgba(226, 248, 4, 0.7);
+  cursor: pointer;
+}
+
+input[type="range"].bench-slider::-moz-range-thumb {
+  width: 24px;
+  height: 24px;
+  border-radius: 50%;
+  background: #E2F804;
+  border: 2px solid #090A0F;
+  box-shadow: 0 0 10px rgba(226, 248, 4, 0.7);
+  cursor: pointer;
+}
