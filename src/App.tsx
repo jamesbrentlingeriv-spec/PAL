@@ -14,9 +14,10 @@ import {
   RefreshCw,
   WifiOff,
   Crosshair,
-  Plus,
   Layers,
-  AlertTriangle
+  AlertTriangle,
+  Focus,
+  HelpCircle
 } from 'lucide-react';
 import {
   CVFilterMode,
@@ -29,7 +30,7 @@ import {
   deleteCustomLensDesign
 } from './db/palDatabase';
 import { SEED_PAL_LENSES } from './data/seedLenses';
-import { applyOpticalCVFilter } from './utils/cvFilters';
+import { applyOpticalCVFilter, resetTemporalBuffer } from './utils/cvFilters';
 import {
   renderSimulatedLensFrame,
   SimulatedSpecimenConfig
@@ -57,13 +58,13 @@ const CV_FILTERS: {
     label: 'Raw Passthrough',
     shortLabel: '1. Raw Feed',
     badge: 'PASSTHROUGH',
-    desc: 'Unmodified optical sensor feed'
+    desc: 'Unmodified phone camera feed'
   },
   {
     id: 'highpass',
     label: 'High-Pass Relief Filter',
     shortLabel: '2. High-Pass Relief',
-    badge: 'LAPLACIAN 3x3',
+    badge: '3D RELIEF',
     desc: 'Isolates 2–5µm laser micro-etch relief'
   },
   {
@@ -90,13 +91,21 @@ export const App: React.FC = () => {
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const leftLoupeCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const rightLoupeCanvasRef = useRef<HTMLCanvasElement | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
 
   const [useSimulatedBench, setUseSimulatedBench] = useState<boolean>(false);
+  const [cameraReady, setCameraReady] = useState<boolean>(false);
+  const [cameraErrorMsg, setCameraErrorMsg] = useState<string | null>(null);
   const [cameraStatusNote, setCameraStatusNote] = useState<string | null>(null);
   const [videoDevices, setVideoDevices] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
-  const [sensorPreset, setSensorPreset] = useState<'macro' | 'main' | 'tele'>('macro');
+
+  // Hardware camera capabilities (Native Zoom & Macro Focus Distance)
+  const [hwZoomRange, setHwZoomRange] = useState<{ min: number; max: number } | null>(null);
+  const [hwFocusRange, setHwFocusRange] = useState<{ min: number; max: number } | null>(null);
+  const [manualFocusDist, setManualFocusDist] = useState<number | null>(null);
 
   // Torch / Flashlight & iOS Darkfield Ring fallback
   const [torchActive, setTorchActive] = useState<boolean>(false);
@@ -105,16 +114,19 @@ export const App: React.FC = () => {
 
   // Computer Vision Filter & Sensitivity state
   const [cvMode, setCvMode] = useState<CVFilterMode>('darkfield');
-  const [cvSensitivity, setCvSensitivity] = useState<number>(1.55);
-  const [glareSuppression, setGlareSuppression] = useState<number>(0.7);
+  const [cvSensitivity, setCvSensitivity] = useState<number>(1.85);
+  const [glareSuppression, setGlareSuppression] = useState<number>(0.75);
+  const [temporalDenoise, setTemporalDenoise] = useState<boolean>(true);
   const [showCvTuner, setShowCvTuner] = useState<boolean>(false);
+  const [showMacroLoupes, setShowMacroLoupes] = useState<boolean>(true);
+  const [showBenchTips, setShowBenchTips] = useState<boolean>(false);
 
   // Zoom, Focus Lock, Freeze Frame
-  const [zoom, setZoom] = useState<number>(1.0);
+  const [zoom, setZoom] = useState<number>(1.5);
   const [isFrozen, setIsFrozen] = useState<boolean>(false);
   const [focusPoint, setFocusPoint] = useState<{ x: number; y: number } | null>(null);
   const pinchStartDistRef = useRef<number | null>(null);
-  const pinchStartZoomRef = useRef<number>(1.0);
+  const pinchStartZoomRef = useRef<number>(1.5);
 
   // Viewport size tracking for accurate SVG Reticle HUD
   const scopeContainerRef = useRef<HTMLDivElement | null>(null);
@@ -139,12 +151,12 @@ export const App: React.FC = () => {
 
   // Simulated Specimen State (for camera-free bench testing or training)
   const [simulatedSpecimen, setSimulatedSpecimen] = useState<SimulatedSpecimenConfig>({
-    lens: SEED_PAL_LENSES[0], // Varilux Comfort Max
+    lens: SEED_PAL_LENSES[0],
     eyeSide: 'OD',
     addPowerDisplay: '20',
     materialCode: 'P',
     glareAngle: 0.4,
-    etchContrast: 0.78
+    etchContrast: 0.82
   });
 
   // Search & Multi-Criteria Identifier State (Module C)
@@ -193,61 +205,122 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('resize', updateSize);
   }, []);
 
-  // Initialize WebRTC Camera or fallback cleanly to Simulated Bench Scope
-  const startCameraStream = useCallback(
-    async (deviceId?: string) => {
-      if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
-        setUseSimulatedBench(true);
-        setCameraStatusNote(
-          'WebRTC camera API unavailable on this workstation — Active Optical Specimen Simulator engaged.'
-        );
-        return;
+  // Start Live Phone Camera Stream (Optimized for iOS Safari & Android Chrome high-res macro)
+  const startCameraStream = useCallback(async (deviceId?: string) => {
+    setCameraErrorMsg(null);
+    resetTemporalBuffer();
+
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      setCameraReady(false);
+      setCameraErrorMsg(
+        'Camera access requires HTTPS (e.g. GitHub Pages or localhost). Using Simulator until HTTPS camera is opened.'
+      );
+      setUseSimulatedBench(true);
+      return;
+    }
+
+    try {
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach((t) => t.stop());
       }
 
-      try {
-        if (streamRef.current) {
-          streamRef.current.getTracks().forEach((t) => t.stop());
-        }
+      // Request high-resolution rear camera stream so 2-5µm engravings have plenty of pixels
+      const videoConstraints: MediaTrackConstraints = deviceId
+        ? {
+            deviceId: { exact: deviceId },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 60, min: 24 }
+          }
+        : {
+            facingMode: { ideal: 'environment' },
+            width: { ideal: 1920 },
+            height: { ideal: 1080 },
+            frameRate: { ideal: 60, min: 24 }
+          };
 
-        const constraints: MediaStreamConstraints = {
-          audio: false,
-          video: deviceId
-            ? {
-                deviceId: { exact: deviceId },
-                width: { ideal: 1920 },
-                height: { ideal: 1080 }
-              }
-            : {
-                facingMode: { ideal: 'environment' },
-                width: { ideal: 1920 },
-                height: { ideal: 1080 }
-              }
-        };
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: videoConstraints
+      });
 
-        const stream = await navigator.mediaDevices.getUserMedia(constraints);
-        streamRef.current = stream;
+      streamRef.current = stream;
 
-        if (videoRef.current) {
-          videoRef.current.srcObject = stream;
-          await videoRef.current.play().catch(() => {});
-        }
-
-        const devices = await navigator.mediaDevices.enumerateDevices();
-        const cams = devices.filter((d) => d.kind === 'videoinput');
-        setVideoDevices(cams);
-
-        setUseSimulatedBench(false);
-        setCameraStatusNote(null);
-      } catch {
-        // Fallback to high-precision Optical Specimen Simulator when no camera is attached or permission denied
-        setUseSimulatedBench(true);
-        setCameraStatusNote(
-          'Live camera unavailable or restricted — Interactive 34mm Laser Engraving Simulator active.'
-        );
+      if (videoRef.current) {
+        const v = videoRef.current;
+        v.srcObject = stream;
+        v.setAttribute('playsinline', 'true');
+        v.setAttribute('webkit-playsinline', 'true');
+        v.muted = true;
+        await v.play();
       }
-    },
-    []
-  );
+
+      // Inspect hardware camera track capabilities (Macro Focus, Continuous AF, Native Zoom)
+      const videoTrack = stream.getVideoTracks()[0];
+      if (videoTrack) {
+        const settings = videoTrack.getSettings();
+        if (settings.deviceId) {
+          setSelectedDeviceId(settings.deviceId);
+        }
+
+        if (typeof videoTrack.getCapabilities === 'function') {
+          const caps = videoTrack.getCapabilities() as Record<string, unknown>;
+
+          // Enable continuous autofocus for close-range lens inspection
+          if (Array.isArray(caps.focusMode) && caps.focusMode.includes('continuous')) {
+            videoTrack
+              .applyConstraints({
+                advanced: [{ focusMode: 'continuous' } as unknown as MediaTrackConstraintSet]
+              })
+              .catch(() => {});
+          }
+
+          if (
+            caps.zoom &&
+            typeof caps.zoom === 'object' &&
+            'min' in caps.zoom &&
+            'max' in caps.zoom
+          ) {
+            setHwZoomRange({
+              min: Number((caps.zoom as { min: number }).min) || 1,
+              max: Number((caps.zoom as { max: number }).max) || 4
+            });
+          } else {
+            setHwZoomRange(null);
+          }
+
+          if (
+            caps.focusDistance &&
+            typeof caps.focusDistance === 'object' &&
+            'min' in caps.focusDistance &&
+            'max' in caps.focusDistance
+          ) {
+            const minFocus = Number((caps.focusDistance as { min: number }).min) || 0.05;
+            const maxFocus = Number((caps.focusDistance as { max: number }).max) || 1.0;
+            setHwFocusRange({ min: minFocus, max: maxFocus });
+          } else {
+            setHwFocusRange(null);
+          }
+        }
+      }
+
+      // Enumerate all rear/macro/telephoto cameras once permission is granted
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const cams = devices.filter((d) => d.kind === 'videoinput');
+      setVideoDevices(cams);
+
+      setCameraReady(true);
+      setUseSimulatedBench(false);
+      setCameraStatusNote(null);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Camera permission denied';
+      setCameraReady(false);
+      setCameraErrorMsg(
+        `Phone camera not active (${msg}). Tap "Activate Phone Camera" to grant permission, or use Demo Sim.`
+      );
+      setUseSimulatedBench(true);
+    }
+  }, []);
 
   useEffect(() => {
     startCameraStream();
@@ -257,6 +330,41 @@ export const App: React.FC = () => {
       }
     };
   }, [startCameraStream]);
+
+  // Sync hardware optical zoom when user adjusts zoom slider
+  useEffect(() => {
+    if (!useSimulatedBench && streamRef.current && hwZoomRange) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track && typeof track.applyConstraints === 'function') {
+        const clampedHwZoom = Math.min(hwZoomRange.max, Math.max(hwZoomRange.min, zoom));
+        track
+          .applyConstraints({
+            advanced: [{ zoom: clampedHwZoom } as unknown as MediaTrackConstraintSet]
+          })
+          .catch(() => {});
+      }
+    }
+  }, [zoom, useSimulatedBench, hwZoomRange]);
+
+  // Apply manual macro focus distance when adjusted by user
+  const handleManualFocusChange = (dist: number) => {
+    setManualFocusDist(dist);
+    if (!useSimulatedBench && streamRef.current) {
+      const track = streamRef.current.getVideoTracks()[0];
+      if (track && typeof track.applyConstraints === 'function') {
+        track
+          .applyConstraints({
+            advanced: [
+              {
+                focusMode: 'manual',
+                focusDistance: dist
+              } as unknown as MediaTrackConstraintSet
+            ]
+          })
+          .catch(() => {});
+      }
+    }
+  };
 
   // Torch / Flashlight hardware toggle with iOS Safari Edge-Light Darkfield fallback
   const handleToggleTorch = async () => {
@@ -276,54 +384,51 @@ export const App: React.FC = () => {
             setTorchActive(nextState);
             setTorchNotice(
               nextState
-                ? 'Hardware Torch Active — Hold lens at 35° oblique grazing angle'
+                ? 'Phone Flashlight ON — Tilt lens 30°–45° over a dark background so light grazes the surface'
                 : null
             );
+            setTimeout(() => setTorchNotice(null), 5000);
             return;
           }
         } catch {
-          // Hardware torch unsupported on iOS Safari or desktop webcam
+          // Hardware torch unsupported on iOS Safari
         }
       }
     }
 
-    // Fallback: Activate High-Luminance OLED Bezel Grazing Light Ring & boost simulated oblique scatter
     setTorchActive(nextState);
     setEdgeRingLightActive(nextState);
     setSimulatedSpecimen((prev) => ({
       ...prev,
-      etchContrast: nextState ? 1.0 : 0.78
+      etchContrast: nextState ? 1.0 : 0.82
     }));
     setTorchNotice(
       nextState
-        ? 'Darkfield Grazing Illumination Active (Hardware Torch restricted on iOS/Desktop; Bezel Ring Light + Grazing Boost enabled)'
+        ? 'Darkfield Screen Ring ON — Tilt lens 35° over a black cloth or dark surface to see engravings'
         : null
     );
-    setTimeout(() => setTorchNotice(null), 4200);
+    setTimeout(() => setTorchNotice(null), 5000);
   };
 
-  // Sensor Preset Switcher (Macro / Main / Telephoto)
-  const handleCycleSensor = () => {
-    const order: ('macro' | 'main' | 'tele')[] = ['macro', 'main', 'tele'];
-    const nextPreset = order[(order.indexOf(sensorPreset) + 1) % order.length];
-    setSensorPreset(nextPreset);
-
+  // Switch between multiple phone rear lenses (e.g., Main 1x, Ultra-Wide Macro 0.5x, Telephoto 2x/3x)
+  const handleCycleCameraDevice = () => {
     if (videoDevices.length > 1) {
       const currentIdx = videoDevices.findIndex((d) => d.deviceId === selectedDeviceId);
       const nextDevice = videoDevices[(currentIdx + 1) % videoDevices.length];
       if (nextDevice) {
         setSelectedDeviceId(nextDevice.deviceId);
         startCameraStream(nextDevice.deviceId);
+        setCameraStatusNote(
+          `Switched Sensor: ${nextDevice.label || `Camera ${(currentIdx + 1) % videoDevices.length + 1}`}`
+        );
+        setTimeout(() => setCameraStatusNote(null), 3500);
       }
     } else {
-      // Adjust optical magnification preset when single sensor is present
-      if (nextPreset === 'macro') setZoom(1.5);
-      else if (nextPreset === 'tele') setZoom(2.2);
-      else setZoom(1.0);
+      startCameraStream();
     }
   };
 
-  // Real-Time 60fps Vision Enhancement Render Loop
+  // Real-Time 60fps Vision Enhancement Render Loop + Dual 34mm Target Macro Loupes
   useEffect(() => {
     let animId: number;
 
@@ -332,14 +437,15 @@ export const App: React.FC = () => {
         const canvas = canvasRef.current;
         const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-        // Keep internal processing resolution crisp yet fast for 60fps CV filters
-        const targetW = Math.min(960, Math.max(640, Math.floor(viewportSize.width * 0.85)));
-        const aspect = viewportSize.height / Math.max(1, viewportSize.width);
-        const targetH = Math.max(400, Math.floor(targetW * aspect));
+        // High-definition processing buffer so 2-5µm laser marks remain crisp on mobile
+        const targetW = Math.min(1080, Math.max(720, Math.floor(viewportSize.width * 0.95)));
+        const aspect = Math.max(320, viewportSize.height - 64) / Math.max(1, viewportSize.width);
+        const targetH = Math.max(480, Math.floor(targetW * aspect));
 
         if (canvas.width !== targetW || canvas.height !== targetH) {
           canvas.width = targetW;
           canvas.height = targetH;
+          resetTemporalBuffer();
         }
 
         if (!offscreenCanvasRef.current) {
@@ -356,23 +462,39 @@ export const App: React.FC = () => {
           const scaleFactor = targetW / Math.max(1, viewportSize.width);
           const effectivePxPerMm = reticleConfig.pxPerMm * scaleFactor;
 
-          if (
+          const vid = videoRef.current;
+          const isLiveVideoValid =
             !useSimulatedBench &&
-            videoRef.current &&
-            videoRef.current.readyState >= 2 &&
-            videoRef.current.videoWidth > 0
-          ) {
-            const vid = videoRef.current;
+            vid &&
+            vid.readyState >= 2 &&
+            vid.videoWidth > 0 &&
+            vid.videoHeight > 0;
+
+          if (isLiveVideoValid && vid) {
             const vw = vid.videoWidth;
             const vh = vid.videoHeight;
-            // Apply digital zoom crop around center
-            const cropW = vw / zoom;
-            const cropH = vh / zoom;
-            const sx = (vw - cropW) / 2;
-            const sy = (vh - cropH) / 2;
-            offCtx.drawImage(vid, sx, sy, cropW, cropH, 0, 0, targetW, targetH);
+            const canvasAspect = targetW / targetH;
+            const videoAspect = vw / vh;
+
+            // Compute distortion-free `object-fit: cover` crop from native phone camera frame
+            let baseCropW = vw;
+            let baseCropH = vh;
+            if (videoAspect > canvasAspect) {
+              baseCropW = vh * canvasAspect;
+            } else {
+              baseCropH = vw / canvasAspect;
+            }
+
+            // If hardware zoom is active, only apply residual digital zoom; otherwise full digital zoom
+            const digitalZoomFactor = hwZoomRange ? Math.max(1.0, zoom / Math.min(hwZoomRange.max, zoom)) : zoom;
+            const finalCropW = baseCropW / digitalZoomFactor;
+            const finalCropH = baseCropH / digitalZoomFactor;
+            const sx = (vw - finalCropW) / 2;
+            const sy = (vh - finalCropH) / 2;
+
+            offCtx.drawImage(vid, sx, sy, finalCropW, finalCropH, 0, 0, targetW, targetH);
           } else {
-            // Render realistic progressive lens specimen with faint 2-5µm laser markings
+            // Render realistic progressive lens specimen when in Demo/Simulator mode
             offCtx.save();
             if (zoom !== 1) {
               offCtx.translate(targetW / 2, targetH / 2);
@@ -398,9 +520,54 @@ export const App: React.FC = () => {
           applyOpticalCVFilter(imageData, {
             mode: cvMode,
             sensitivity: cvSensitivity,
-            glareSuppression
+            glareSuppression,
+            temporalSmoothing: temporalDenoise
           });
           ctx.putImageData(imageData, 0, 0);
+
+          // Update Dual 4x Target Macro Loupes (Left -17mm & Right +17mm Brackets)
+          if (showMacroLoupes && leftLoupeCanvasRef.current && rightLoupeCanvasRef.current) {
+            const cx = targetW / 2;
+            const cy = targetH / 2;
+            const half34Px = 17.0 * effectivePxPerMm * zoom;
+            const sampleRadius = Math.max(28, Math.round(4.6 * effectivePxPerMm * zoom));
+
+            const renderLoupe = (
+              loupeCanvas: HTMLCanvasElement,
+              targetCenterX: number,
+              targetCenterY: number
+            ) => {
+              const lCtx = loupeCanvas.getContext('2d');
+              if (!lCtx) return;
+              const lw = loupeCanvas.width;
+              const lh = loupeCanvas.height;
+              lCtx.fillStyle = '#090A0F';
+              lCtx.fillRect(0, 0, lw, lh);
+              lCtx.drawImage(
+                canvas,
+                Math.max(0, targetCenterX - sampleRadius),
+                Math.max(0, targetCenterY - sampleRadius),
+                sampleRadius * 2,
+                sampleRadius * 2,
+                0,
+                0,
+                lw,
+                lh
+              );
+              // Subtle center alignment crosshair inside each macro loupe
+              lCtx.strokeStyle = 'rgba(226, 248, 4, 0.35)';
+              lCtx.lineWidth = 1;
+              lCtx.beginPath();
+              lCtx.moveTo(lw / 2, 0);
+              lCtx.lineTo(lw / 2, lh);
+              lCtx.moveTo(0, lh / 2);
+              lCtx.lineTo(lw, lh / 2);
+              lCtx.stroke();
+            };
+
+            renderLoupe(leftLoupeCanvasRef.current, cx - half34Px, cy);
+            renderLoupe(rightLoupeCanvasRef.current, cx + half34Px, cy);
+          }
         }
       }
 
@@ -414,9 +581,12 @@ export const App: React.FC = () => {
     viewportSize,
     useSimulatedBench,
     zoom,
+    hwZoomRange,
     cvMode,
     cvSensitivity,
     glareSuppression,
+    temporalDenoise,
+    showMacroLoupes,
     reticleConfig.pxPerMm,
     reticleConfig.eyeSide,
     simulatedSpecimen
@@ -424,13 +594,13 @@ export const App: React.FC = () => {
 
   // Tap-to-Focus & Pinch-to-Zoom Handlers on Scope Viewport
   const handleScopePointerDown = (e: React.MouseEvent<HTMLDivElement>) => {
-    if ((e.target as HTMLElement).closest('button, input')) return;
+    if ((e.target as HTMLElement).closest('button, input, select')) return;
     const rect = e.currentTarget.getBoundingClientRect();
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
     setFocusPoint({ x, y });
 
-    // Attempt hardware point-of-interest focus lock if supported
+    // Trigger hardware continuous/single-shot autofocus re-lock on tap
     if (streamRef.current && !useSimulatedBench) {
       const track = streamRef.current.getVideoTracks()[0];
       if (track && typeof track.applyConstraints === 'function') {
@@ -568,14 +738,17 @@ export const App: React.FC = () => {
     }
   };
 
+  const isOD = reticleConfig.eyeSide === 'OD';
+
   return (
     <div className="relative w-full h-full bg-oled text-white overflow-hidden flex flex-col select-none">
-      {/* Hidden WebRTC Video Element */}
+      {/* IMPORTANT: Never use display:none ('hidden') on <video> for iOS Safari / Mobile WebKit! */}
       <video
         ref={videoRef}
+        autoPlay
         playsInline
         muted
-        className="hidden"
+        className="fixed top-0 left-0 w-px h-px opacity-0 pointer-events-none -z-10"
       />
 
       {/* iOS / Tablet Bezel Darkfield Grazing Ring Light Overlay */}
@@ -586,25 +759,25 @@ export const App: React.FC = () => {
       {/* TOP TACTICAL BENCH HEADER BAR */}
       <header className="relative z-20 px-3 sm:px-5 py-2.5 bg-oled-panel/95 backdrop-blur-md border-b border-oled-border flex flex-wrap items-center justify-between gap-2 shrink-0">
         {/* Brand & Offline Ready Status */}
-        <div className="flex items-center gap-3">
-          <div className="w-10 h-10 rounded-xl bg-oled border-2 border-optic-yellow flex items-center justify-center shadow-neon-yellow">
-            <Crosshair className="w-6 h-6 text-optic-yellow" />
+        <div className="flex items-center gap-2.5">
+          <div className="w-9 h-9 sm:w-10 sm:h-10 rounded-xl bg-oled border-2 border-optic-yellow flex items-center justify-center shadow-neon-yellow">
+            <Crosshair className="w-5 h-5 sm:w-6 sm:h-6 text-optic-yellow" />
           </div>
           <div>
             <div className="flex items-center gap-2">
-              <h1 className="text-base sm:text-lg font-black tracking-wider uppercase text-white">
+              <h1 className="text-sm sm:text-lg font-black tracking-wider uppercase text-white">
                 PAL-SCOPE
               </h1>
               <span className="px-2 py-0.5 rounded bg-optic-yellow text-oled font-mono text-[10px] font-black uppercase">
-                34.0 MM BENCH HUD
+                {useSimulatedBench ? 'SIMULATOR' : 'LIVE CAMERA'}
               </span>
               <span className="hidden md:inline-flex items-center gap-1 px-2 py-0.5 rounded bg-optic-emerald/15 border border-optic-emerald/40 text-optic-emerald font-mono text-[10px] font-bold">
                 <WifiOff className="w-3 h-3" />
-                100% OFFLINE DB ({lenses.length} PALs)
+                OFFLINE ({lenses.length} PALs)
               </span>
             </div>
             <p className="text-[11px] font-mono text-slate-400 hidden sm:block">
-              Excimer Laser Micro-Engraving Darkfield Identifier & OLA Reference Scope
+              Hold lens over dark background • Use Torch at 35° angle • Align 34mm targets
             </p>
           </div>
         </div>
@@ -632,9 +805,6 @@ export const App: React.FC = () => {
 
           {/* Fitting Cross Vertical Drop Selector (+2mm, +4mm, +6mm) */}
           <div className="flex items-center rounded-xl bg-oled border border-oled-border p-0.5">
-            <span className="px-2 text-[10px] font-mono uppercase text-slate-400 hidden xl:inline">
-              FC Drop:
-            </span>
             {([2, 4, 6] as const).map((drop) => {
               const activeDrop = pinnedLens
                 ? pinnedLens.fittingCrossDropMm
@@ -649,13 +819,13 @@ export const App: React.FC = () => {
                       fittingCrossOffsetMm: drop
                     }));
                   }}
-                  className={`px-2.5 py-1.5 rounded-lg font-mono text-xs font-bold transition-all ${
+                  className={`px-2 py-1.5 rounded-lg font-mono text-xs font-bold transition-all ${
                     activeDrop === drop
                       ? 'bg-optic-yellow text-oled shadow-neon-yellow'
                       : 'text-slate-400 hover:text-white'
                   }`}
                 >
-                  +{drop}mm
+                  +{drop}
                 </button>
               );
             })}
@@ -664,22 +834,22 @@ export const App: React.FC = () => {
           {/* 34mm Scale Calibration Trigger */}
           <button
             onClick={() => setIsCalibrationOpen(true)}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-xl bg-oled border border-oled-border hover:border-optic-yellow text-slate-200 font-mono text-xs font-bold transition-colors"
+            className="flex items-center gap-1 px-2.5 py-2 rounded-xl bg-oled border border-oled-border hover:border-optic-yellow text-slate-200 font-mono text-xs font-bold transition-colors"
             title="Calibrate Physical 34.0 mm Screen Scale"
           >
             <Ruler className="w-4 h-4 text-optic-yellow" />
-            <span className="hidden sm:inline">Calibrate</span>
+            <span className="hidden sm:inline">34mm Scale</span>
           </button>
 
           {/* Torch / Grazing Flashlight Toggle */}
           <button
             onClick={handleToggleTorch}
-            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border font-mono text-xs font-bold transition-all ${
+            className={`flex items-center gap-1 px-2.5 py-2 rounded-xl border font-mono text-xs font-bold transition-all ${
               torchActive
                 ? 'bg-optic-yellow text-oled border-optic-yellow shadow-neon-yellow'
                 : 'bg-oled border-oled-border text-slate-200 hover:border-optic-yellow'
             }`}
-            title="Toggle Oblique Grazing Torch / Darkfield Ring"
+            title="Toggle Phone Flashlight / Darkfield Grazing Light"
           >
             <Flashlight className="w-4 h-4" />
             <span className="hidden sm:inline">{torchActive ? 'Torch ON' : 'Torch'}</span>
@@ -688,7 +858,7 @@ export const App: React.FC = () => {
           {/* Freeze Frame / Snapshot Toggle */}
           <button
             onClick={() => setIsFrozen((prev) => !prev)}
-            className={`flex items-center gap-1.5 px-3.5 py-2 rounded-xl border font-mono text-xs font-extrabold transition-all ${
+            className={`flex items-center gap-1.5 px-3 py-2 rounded-xl border font-mono text-xs font-extrabold transition-all ${
               isFrozen
                 ? 'bg-optic-cyan text-oled border-optic-cyan shadow-neon-cyan'
                 : 'bg-oled border-oled-border text-white hover:border-optic-cyan'
@@ -697,7 +867,7 @@ export const App: React.FC = () => {
             {isFrozen ? (
               <>
                 <Play className="w-4 h-4 fill-current" />
-                <span>Resume</span>
+                <span>Live</span>
               </>
             ) : (
               <>
@@ -734,71 +904,102 @@ export const App: React.FC = () => {
           focusPoint={focusPoint}
         />
 
-        {/* Top-Left Status & Simulated Specimen Selector Pill */}
-        <div className="absolute top-3 left-3 z-20 flex flex-col gap-2 max-w-xs sm:max-w-md">
-          <div className="flex flex-wrap items-center gap-2">
-            {/* Live Camera vs Simulated Specimen Mode Toggle */}
-            <button
-              onClick={() => {
-                if (useSimulatedBench) {
-                  startCameraStream(selectedDeviceId || undefined);
-                } else {
-                  setUseSimulatedBench(true);
-                }
-              }}
-              className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-oled-panel/90 backdrop-blur-md border border-oled-border hover:border-optic-cyan text-xs font-mono font-bold text-slate-200 shadow-lg"
-            >
-              <Camera className="w-3.5 h-3.5 text-optic-cyan" />
-              <span>
-                {useSimulatedBench ? 'Mode: Bench Specimen Sim' : `Live Sensor (${sensorPreset.toUpperCase()})`}
+        {/* DUAL 4X MACRO TARGET LOUPE WINDOWS (Shows Left -17mm & Right +17mm Brackets Magnified!) */}
+        {showMacroLoupes && (
+          <div className="pointer-events-none absolute top-14 sm:top-3 left-1/2 -translate-x-1/2 z-20 flex items-center gap-3 bg-oled-panel/90 backdrop-blur-md border border-oled-border px-3 py-2 rounded-2xl shadow-2xl">
+            <div className="flex flex-col items-center">
+              <span className="text-[9px] font-mono font-bold uppercase text-optic-yellow mb-1">
+                {isOD ? '◄ Left (-17mm Temporal)' : '◄ Left (-17mm Nasal Add)'}
               </span>
-              <RefreshCw className="w-3 h-3 text-slate-400" />
-            </button>
+              <canvas
+                ref={leftLoupeCanvasRef}
+                width={104}
+                height={76}
+                className="w-[104px] h-[76px] rounded-lg border-2 border-optic-yellow bg-oled"
+              />
+            </div>
 
-            {!useSimulatedBench && (
+            <div className="flex flex-col items-center">
+              <span className="text-[9px] font-mono font-bold uppercase text-optic-cyan mb-1">
+                {isOD ? 'Right (+17mm Nasal Add) ►' : 'Right (+17mm Temporal) ►'}
+              </span>
+              <canvas
+                ref={rightLoupeCanvasRef}
+                width={104}
+                height={76}
+                className="w-[104px] h-[76px] rounded-lg border-2 border-optic-cyan bg-oled"
+              />
+            </div>
+          </div>
+        )}
+
+        {/* Top-Left Camera Selector & Simulator Switcher */}
+        <div className="absolute top-3 left-3 z-20 flex flex-col gap-2 max-w-[260px] sm:max-w-sm">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {/* Activate Live Phone Camera or Switch to Demo Sim */}
+            {useSimulatedBench ? (
               <button
-                onClick={handleCycleSensor}
-                className="px-2.5 py-1.5 rounded-xl bg-oled-panel/90 backdrop-blur-md border border-oled-border hover:border-optic-yellow text-xs font-mono font-bold text-optic-yellow"
+                onClick={() => startCameraStream(selectedDeviceId || undefined)}
+                className="flex items-center gap-2 px-3.5 py-2 rounded-xl bg-optic-yellow text-oled font-mono text-xs font-extrabold shadow-neon-yellow animate-pulse"
               >
-                Lens: {sensorPreset.toUpperCase()}
+                <Camera className="w-4 h-4" />
+                <span>Activate Phone Camera</span>
+              </button>
+            ) : (
+              <button
+                onClick={handleCycleCameraDevice}
+                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-oled-panel/90 backdrop-blur-md border border-optic-cyan text-xs font-mono font-bold text-optic-cyan shadow-lg"
+              >
+                <Camera className="w-3.5 h-3.5" />
+                <span>
+                  {videoDevices.length > 1
+                    ? `Switch Camera (${videoDevices.length} Lenses)`
+                    : 'Phone Camera Active'}
+                </span>
+                <RefreshCw className="w-3 h-3" />
               </button>
             )}
+
+            <button
+              onClick={() => setUseSimulatedBench((prev) => !prev)}
+              className="px-2.5 py-1.5 rounded-xl bg-oled-panel/90 backdrop-blur-md border border-oled-border hover:border-optic-yellow text-[11px] font-mono font-semibold text-slate-300"
+            >
+              {useSimulatedBench ? 'Sim Mode' : 'Try Demo Lens'}
+            </button>
 
             {useSimulatedBench && (
               <button
                 onClick={handleCycleSimulatedSpecimen}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-optic-yellow/15 backdrop-blur-md border border-optic-yellow/60 text-optic-yellow text-xs font-mono font-bold hover:bg-optic-yellow/25 transition-colors"
+                className="flex items-center gap-1 px-2.5 py-1.5 rounded-xl bg-optic-yellow/15 backdrop-blur-md border border-optic-yellow/60 text-optic-yellow text-[11px] font-mono font-bold"
               >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>
-                  Specimen: {simulatedSpecimen.lens.designName} (+{simulatedSpecimen.addPowerDisplay})
-                </span>
+                <Sparkles className="w-3 h-3" />
+                <span>{simulatedSpecimen.lens.designName}</span>
               </button>
             )}
           </div>
 
-          {/* Camera Fallback or Torch Guidance Banner */}
-          {(cameraStatusNote || torchNotice) && (
-            <div className="px-3 py-2 rounded-xl bg-oled-panel/90 backdrop-blur-md border border-oled-border text-[11px] font-mono text-slate-300 flex items-center gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 text-optic-yellow shrink-0" />
-              <span>{torchNotice || cameraStatusNote}</span>
+          {/* Camera Error / Guidance Banner */}
+          {(cameraErrorMsg || cameraStatusNote || torchNotice) && (
+            <div className="px-3 py-2 rounded-xl bg-oled-panel/95 backdrop-blur-md border border-optic-yellow/60 text-[11px] font-mono text-slate-200 flex items-start gap-2 shadow-lg">
+              <AlertTriangle className="w-4 h-4 text-optic-yellow shrink-0 mt-0.5" />
+              <span>{torchNotice || cameraStatusNote || cameraErrorMsg}</span>
             </div>
           )}
 
           {/* Active Pinned Lens Banner */}
           {pinnedLens && (
-            <div className="px-3.5 py-2 rounded-xl bg-oled-panel/95 backdrop-blur-md border-2 border-optic-emerald shadow-lg flex items-center justify-between gap-3">
+            <div className="px-3 py-2 rounded-xl bg-oled-panel/95 backdrop-blur-md border-2 border-optic-emerald shadow-lg flex items-center justify-between gap-2">
               <div>
-                <span className="text-[10px] font-mono uppercase text-optic-emerald font-bold block">
-                  Pinned Reticle Verification
+                <span className="text-[9px] font-mono uppercase text-optic-emerald font-bold block">
+                  Pinned Reticle Overlay
                 </span>
                 <span className="text-xs font-bold text-white">
-                  {pinnedLens.brand} {pinnedLens.designName} (FC +{pinnedLens.fittingCrossDropMm}mm | Min {pinnedLens.minFittingHeightMm}mm)
+                  {pinnedLens.brand} {pinnedLens.designName} (+{pinnedLens.fittingCrossDropMm}mm)
                 </span>
               </div>
               <button
                 onClick={() => setPinnedLens(null)}
-                className="px-2 py-1 rounded bg-oled border border-oled-border text-xs font-mono text-slate-300 hover:text-white"
+                className="px-2 py-0.5 rounded bg-oled border border-oled-border text-xs font-mono text-slate-300 hover:text-white"
               >
                 ✕
               </button>
@@ -806,51 +1007,59 @@ export const App: React.FC = () => {
           )}
         </div>
 
-        {/* Top-Right HUD Controls (Reticle Visibility, Corridor Zone, Snapshot Save) */}
+        {/* Top-Right HUD Controls (Macro Loupes, HUD, Gain/Focus Tuner, Viewing Guide) */}
         <div className="absolute top-3 right-3 z-20 flex flex-col items-end gap-2">
           <div className="flex items-center gap-1.5">
+            <button
+              onClick={() => setShowMacroLoupes((prev) => !prev)}
+              className={`px-2.5 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1 ${
+                showMacroLoupes
+                  ? 'bg-oled-panel/90 border-optic-yellow text-optic-yellow'
+                  : 'bg-oled-panel/80 border-oled-border text-slate-400'
+              }`}
+              title="Toggle 4x Target Macro Loupes"
+            >
+              <Focus className="w-3.5 h-3.5" />
+              <span className="hidden sm:inline">4x Loupes</span>
+            </button>
+
             <button
               onClick={() =>
                 setReticleConfig((prev) => ({ ...prev, showReticle: !prev.showReticle }))
               }
-              className={`px-3 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1.5 ${
+              className={`px-2.5 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1 ${
                 reticleConfig.showReticle
                   ? 'bg-oled-panel/90 border-optic-cyan text-optic-cyan'
                   : 'bg-oled-panel/80 border-oled-border text-slate-400'
               }`}
             >
               <Eye className="w-3.5 h-3.5" />
-              <span>HUD</span>
-            </button>
-
-            <button
-              onClick={() =>
-                setReticleConfig((prev) => ({
-                  ...prev,
-                  showCorridorZone: !prev.showCorridorZone
-                }))
-              }
-              className={`px-3 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1.5 ${
-                reticleConfig.showCorridorZone
-                  ? 'bg-oled-panel/90 border-optic-emerald text-optic-emerald'
-                  : 'bg-oled-panel/80 border-oled-border text-slate-400'
-              }`}
-            >
-              <Layers className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Corridor</span>
+              <span className="hidden sm:inline">HUD</span>
             </button>
 
             <button
               onClick={() => setShowCvTuner((prev) => !prev)}
-              className={`px-3 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1.5 ${
+              className={`px-2.5 py-1.5 rounded-xl border font-mono text-xs font-bold transition-colors flex items-center gap-1 ${
                 showCvTuner
                   ? 'bg-optic-yellow text-oled border-optic-yellow'
                   : 'bg-oled-panel/90 border-oled-border text-slate-200 hover:border-optic-yellow'
               }`}
-              title="Fine-Tune Edge Gain & Glare Suppression"
+              title="Adjust Laser Contrast Gain & Macro Focus"
             >
               <Sliders className="w-3.5 h-3.5" />
-              <span className="hidden sm:inline">Gain</span>
+              <span>Enhance</span>
+            </button>
+
+            <button
+              onClick={() => setShowBenchTips((prev) => !prev)}
+              className={`p-1.5 rounded-xl border transition-colors ${
+                showBenchTips
+                  ? 'bg-optic-cyan text-oled border-optic-cyan'
+                  : 'bg-oled-panel/90 border-oled-border text-optic-cyan'
+              }`}
+              title="How to See Faint PAL Markings with Phone Camera"
+            >
+              <HelpCircle className="w-4 h-4" />
             </button>
           </div>
 
@@ -858,25 +1067,56 @@ export const App: React.FC = () => {
           {isFrozen && (
             <button
               onClick={handleDownloadSnapshot}
-              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-optic-yellow text-oled font-mono text-xs font-extrabold shadow-neon-yellow animate-pulse"
+              className="flex items-center gap-1.5 px-3.5 py-2 rounded-xl bg-optic-yellow text-oled font-mono text-xs font-extrabold shadow-neon-yellow"
             >
               <Download className="w-4 h-4" />
-              Save Frozen Frame PNG
+              Save Snapshot PNG
             </button>
           )}
 
-          {/* CV Filter Gain & Glare Suppression Popover */}
+          {/* How to See Real PAL Markings Bench Technique Card */}
+          {showBenchTips && (
+            <div className="w-72 sm:w-80 p-4 rounded-2xl bg-oled-panel/95 backdrop-blur-xl border-2 border-optic-cyan shadow-2xl space-y-2.5 text-left">
+              <div className="flex items-center justify-between">
+                <span className="text-xs font-mono font-extrabold uppercase text-optic-cyan">
+                  Phone Camera PAL Viewing Technique
+                </span>
+                <button
+                  onClick={() => setShowBenchTips(false)}
+                  className="text-xs font-mono text-slate-400 hover:text-white"
+                >
+                  ✕
+                </button>
+              </div>
+              <ol className="text-xs text-slate-200 space-y-1.5 list-decimal list-inside">
+                <li>
+                  <strong className="text-optic-yellow">Dark Background:</strong> Hold the glasses 3–4 inches above a matte black cloth or dark table (never against a bright ceiling light).
+                </li>
+                <li>
+                  <strong className="text-optic-yellow">Grazing Light (35°):</strong> Turn on <strong>Torch</strong> or shine a penlight across the lens edge at an oblique 35° angle so the 2–5µm laser grooves scatter light into the camera.
+                </li>
+                <li>
+                  <strong className="text-optic-yellow">Switch Camera / 1.5x–2.5x Zoom:</strong> Tap <strong>Switch Camera</strong> if your phone has a Macro/Ultra-Wide lens, or set zoom to <strong>1.5x–2.5x</strong> so the phone focuses sharply.
+                </li>
+                <li>
+                  <strong className="text-optic-yellow">Use Filter #4 (Inv. Darkfield) or #2 (Relief):</strong> Adjust the <strong>Enhance</strong> slider until the faint engraving pops inside the <strong>4x Macro Loupes</strong>!
+                </li>
+              </ol>
+            </div>
+          )}
+
+          {/* CV Filter Gain, Glare Suppression, Macro Focus & Denoise Popover */}
           {showCvTuner && (
-            <div className="w-64 p-3.5 rounded-2xl bg-oled-panel/95 backdrop-blur-xl border border-oled-border shadow-2xl space-y-3">
+            <div className="w-68 sm:w-72 p-3.5 rounded-2xl bg-oled-panel/95 backdrop-blur-xl border border-oled-border shadow-2xl space-y-3">
               <div>
                 <div className="flex justify-between text-xs font-mono mb-1">
-                  <span className="text-slate-300">Laser Etch Gain</span>
+                  <span className="text-slate-300">Laser Etch Contrast Gain</span>
                   <span className="text-optic-yellow font-bold">{cvSensitivity.toFixed(2)}x</span>
                 </div>
                 <input
                   type="range"
                   min="0.6"
-                  max="2.5"
+                  max="3.0"
                   step="0.05"
                   value={cvSensitivity}
                   onChange={(e) => setCvSensitivity(parseFloat(e.target.value))}
@@ -902,6 +1142,26 @@ export const App: React.FC = () => {
                 />
               </div>
 
+              {hwFocusRange && (
+                <div>
+                  <div className="flex justify-between text-xs font-mono mb-1">
+                    <span className="text-optic-emerald">Hardware Macro Focus</span>
+                    <span className="text-optic-emerald font-bold">
+                      {manualFocusDist !== null ? `${manualFocusDist.toFixed(2)}m` : 'Auto'}
+                    </span>
+                  </div>
+                  <input
+                    type="range"
+                    min={hwFocusRange.min}
+                    max={Math.min(0.6, hwFocusRange.max)}
+                    step="0.01"
+                    value={manualFocusDist ?? hwFocusRange.min}
+                    onChange={(e) => handleManualFocusChange(parseFloat(e.target.value))}
+                    className="w-full bench-slider"
+                  />
+                </div>
+              )}
+
               <div>
                 <div className="flex justify-between text-xs font-mono mb-1">
                   <span className="text-slate-300">Reticle Axis Tilt</span>
@@ -922,30 +1182,63 @@ export const App: React.FC = () => {
                   className="w-full bench-slider"
                 />
               </div>
+
+              <div className="flex items-center justify-between pt-1 border-t border-oled-border">
+                <span className="text-xs font-mono text-slate-300">
+                  Multi-Frame Sensor Denoise
+                </span>
+                <button
+                  onClick={() => setTemporalDenoise((prev) => !prev)}
+                  className={`px-2.5 py-1 rounded-lg font-mono text-xs font-bold ${
+                    temporalDenoise
+                      ? 'bg-optic-emerald text-oled'
+                      : 'bg-oled border border-oled-border text-slate-400'
+                  }`}
+                >
+                  {temporalDenoise ? 'ON (Stacking)' : 'OFF'}
+                </button>
+              </div>
             </div>
           )}
         </div>
 
-        {/* Right-Side Digital Zoom Rail (1.0x to 4.0x) */}
+        {/* Right-Side Optical/Digital Zoom Rail (1.0x to 4.0x) */}
         <div className="absolute right-3 bottom-36 z-20 flex flex-col items-center gap-1.5 bg-oled-panel/90 backdrop-blur-md border border-oled-border rounded-2xl p-2 shadow-xl">
           <button
-            onClick={() => setZoom((z) => Math.min(4.0, Number((z + 0.5).toFixed(1))))}
+            onClick={() => setZoom((z) => Math.min(4.0, Number((z + 0.25).toFixed(2))))}
             className="p-2 rounded-xl bg-oled border border-oled-border hover:border-optic-yellow text-slate-200 active:scale-95"
             aria-label="Zoom in"
           >
             <ZoomIn className="w-4 h-4 text-optic-yellow" />
           </button>
 
-          <div className="py-1 px-1.5 font-mono text-xs font-extrabold text-optic-yellow">
+          <div className="py-1 px-1 font-mono text-xs font-extrabold text-optic-yellow">
             {zoom.toFixed(1)}x
           </div>
 
           <button
-            onClick={() => setZoom((z) => Math.max(1.0, Number((z - 0.5).toFixed(1))))}
+            onClick={() => setZoom((z) => Math.max(1.0, Number((z - 0.25).toFixed(2))))}
             className="p-2 rounded-xl bg-oled border border-oled-border hover:border-optic-cyan text-slate-200 active:scale-95"
             aria-label="Zoom out"
           >
             <ZoomOut className="w-4 h-4 text-optic-cyan" />
+          </button>
+
+          <button
+            onClick={() =>
+              setReticleConfig((prev) => ({
+                ...prev,
+                showCorridorZone: !prev.showCorridorZone
+              }))
+            }
+            title="Toggle Corridor Overlay"
+            className={`p-2 rounded-xl border transition-colors ${
+              reticleConfig.showCorridorZone
+                ? 'bg-oled border-optic-emerald text-optic-emerald'
+                : 'bg-oled border-oled-border text-slate-500'
+            }`}
+          >
+            <Layers className="w-4 h-4" />
           </button>
         </div>
 
